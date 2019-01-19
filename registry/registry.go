@@ -14,6 +14,7 @@ import (
 
 	"rsc.io/letsencrypt"
 
+	"github.com/Shopify/logrus-bugsnag"
 	logstash "github.com/bshuster-repo/logrus-logstash-hook"
 	"github.com/bugsnag/bugsnag-go"
 	"github.com/docker/distribution/configuration"
@@ -95,6 +96,8 @@ func NewRegistry(ctx context.Context, config *configuration.Configuration) (*Reg
 		return nil, fmt.Errorf("error configuring logger: %v", err)
 	}
 
+	configureBugsnag(config)
+
 	// inject a logger into the uuid library. warns us if there is a problem
 	// with uuid generation under low entropy.
 	uuid.Loggerf = dcontext.GetLogger(ctx).Warnf
@@ -132,10 +135,26 @@ func (registry *Registry) ListenAndServe() error {
 	}
 
 	if config.HTTP.TLS.Certificate != "" || config.HTTP.TLS.LetsEncrypt.CacheFile != "" {
+		var tlsMinVersion uint16
+		if config.HTTP.TLS.MinimumTLS == "" {
+			tlsMinVersion = tls.VersionTLS10
+		} else {
+			switch config.HTTP.TLS.MinimumTLS {
+			case "tls1.0":
+				tlsMinVersion = tls.VersionTLS10
+			case "tls1.1":
+				tlsMinVersion = tls.VersionTLS11
+			case "tls1.2":
+				tlsMinVersion = tls.VersionTLS12
+			default:
+				return fmt.Errorf("unknown minimum TLS level '%s' specified for http.tls.minimumtls", config.HTTP.TLS.MinimumTLS)
+			}
+			dcontext.GetLogger(registry.app).Infof("restricting TLS to %s or higher", config.HTTP.TLS.MinimumTLS)
+		}
 		tlsConf := &tls.Config{
 			ClientAuth:               tls.NoClientCert,
 			NextProtos:               nextProtos(config),
-			MinVersion:               tls.VersionTLS10,
+			MinVersion:               tlsMinVersion,
 			PreferServerCipherSuites: true,
 			CipherSuites: []uint16{
 				tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
@@ -229,19 +248,6 @@ func configureReporting(app *handlers.App) http.Handler {
 	var handler http.Handler = app
 
 	if app.Config.Reporting.Bugsnag.APIKey != "" {
-		bugsnagConfig := bugsnag.Configuration{
-			APIKey: app.Config.Reporting.Bugsnag.APIKey,
-			// TODO(brianbland): provide the registry version here
-			// AppVersion: "2.0",
-		}
-		if app.Config.Reporting.Bugsnag.ReleaseStage != "" {
-			bugsnagConfig.ReleaseStage = app.Config.Reporting.Bugsnag.ReleaseStage
-		}
-		if app.Config.Reporting.Bugsnag.Endpoint != "" {
-			bugsnagConfig.Endpoint = app.Config.Reporting.Bugsnag.Endpoint
-		}
-		bugsnag.Configure(bugsnagConfig)
-
 		handler = bugsnag.Handler(handler)
 	}
 
@@ -317,6 +323,32 @@ func logLevel(level configuration.Loglevel) log.Level {
 	}
 
 	return l
+}
+
+// configureBugsnag configures bugsnag reporting, if enabled
+func configureBugsnag(config *configuration.Configuration) {
+	if config.Reporting.Bugsnag.APIKey == "" {
+		return
+	}
+
+	bugsnagConfig := bugsnag.Configuration{
+		APIKey: config.Reporting.Bugsnag.APIKey,
+	}
+	if config.Reporting.Bugsnag.ReleaseStage != "" {
+		bugsnagConfig.ReleaseStage = config.Reporting.Bugsnag.ReleaseStage
+	}
+	if config.Reporting.Bugsnag.Endpoint != "" {
+		bugsnagConfig.Endpoint = config.Reporting.Bugsnag.Endpoint
+	}
+	bugsnag.Configure(bugsnagConfig)
+
+	// configure logrus bugsnag hook
+	hook, err := logrus_bugsnag.NewBugsnagHook()
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	log.AddHook(hook)
 }
 
 // panicHandler add an HTTP handler to web app. The handler recover the happening
